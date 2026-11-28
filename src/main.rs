@@ -12,30 +12,46 @@ enum State {
     PLAY
 }
 
-const PORT : &str  = "127.0.0.1:25565";
+const IP : &str  = "127.0.0.1";
+const PORT : u16 = 25565
 
 enum PeakReturn {
     PERFECT { len : usize, val : u32 },
+    INCOMPLETE,
     MALFORMED
 }
 
-fn peak_varint_id(buf : &[u8; 5]) -> PeakReturn {
-    if (buf[4] >> 7) == 1 {
-        return PeakReturn::MALFORMED;
-    }
-    let mut len = 0;
+fn peek_varint(buf: &[u8]) -> PeekReturn {
     let mut total = 0u32;
+    for (i, &byte) in buf.iter().take(5).enumerate() {
+        // checks for varint that would cause overflow in u32s
+        if i == 4 && (byte & 0xf0) != 0 {
+            return PeekReturn::MALFORMED;
+        }
 
-    for &x in buf {
-        let value = (x & 0x7f) as u32;
-        total |= value << (len * 7);
-        len += 1;
+        let value = (byte & 0x7f) as u32;
+        total |= value << (i * 7);
 
-        if (x >> 7) == 0 {
-            return PeakReturn::PERFECT { len, val: total}
+        if (byte & 0x80) == 0 {
+            return PeekReturn::PERFECT {
+                len: i + 1,
+                val: total as i32,
+            };
         }
     }
-    PeakReturn::MALFORMED
+    PeekReturn::INCOMPLETE
+}
+
+fn read_varint(buf: &mut &[u8]) -> Option<i32> {
+    match peak_varint(buf) {
+        PeakReturn::PERFECT { len, val } => {
+            *buf = &buf[len..];
+            Some(val as i32)
+        } 
+        PeakReturn::INCOMPLETE {
+            
+        }
+    } 
 }
 
 fn packet_to_hex(vals: Vec<u8>) -> String {
@@ -54,14 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     rt.block_on(async {
-        let listener = TcpListener::bind(PORT).await?;
-        println!("Server listening on {}", PORT);
+        let listener = TcpListener::bind((&str, u16)).await?;
+        println!("Server listening on {}:{}", IP, PORT);
 
         loop {
             let (mut socket, addr) = listener.accept().await?;
             println!("New cient connected: {}", addr);
 
-            let mut buf = vec![0u32; 512];
+            let mut buf = vec![0u8; 512];
             let mut byte_stack : Vec<u8>;
 
             let mut state = State::HANDSHAKING;
@@ -76,12 +92,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Ok(n) => {
                             println!("Recieved {} bytes from {}: {:?}", n, addr, packet_to_hex(buf[..n].to_vec()));
-                            match peak_varint_id(buf[0..5]) {
-                                PeakReturn::PERFECT { len, val } => {
+                            
+                            match peak_varint(&byte_stack) {
+                                PeakReturn::PERFECT { len : varint_len, val : packet_len } => {
+                                    if packet_len <= 0 {
+                                        eprintln!("Recieved negative (or zero) packet length prefix {}", packet_len);
+                                        return;
+                                    }
+                                    // check if need more bytes
+                                    if (packet_len as usize) + varint_len > byte_stack.len() {
+                                        break;
+                                    }
+                                    // now we can process packet
+                                    byte_stack.drain(..varint_len); // remove and discard varint size header
+                                    let body: Vec<u8> = byte_stack.drain(..packet_len as usize).collect(); // store the actual packet
 
+                                    match peak_varint(&body) {
+                                        PeakReturn::PERFECT { len : id_varint_len, val : packet_id } {
+                                            body.drain(..id_varint_len); 
+                                            match (&state, packet_id) {
+                                                (State::HANDSHAKING, 0) => {
+                                                    // handle state change packet
+
+                                                    
+                                                }
+                                                _ => {
+                                                    eprintln!("Recieve unknown packet ID {} for state {:?}", packet_id, &state);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            return;
+                                        }
+                                    }
+                                }
+                                PeakReturn::INCOMPLETE => {
+                                    break;
                                 }
                                 PeakReturn::MALFORMED => {
-
+                                    return;
                                 }
                             }
                             
